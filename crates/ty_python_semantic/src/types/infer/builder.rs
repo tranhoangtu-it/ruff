@@ -18,6 +18,7 @@ use ruff_python_stdlib::typing::as_pep_585_generic;
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
+use strum::IntoEnumIterator;
 use ty_module_resolver::{KnownModule, ModuleName, resolve_module};
 
 use super::deferred;
@@ -100,6 +101,7 @@ use crate::types::mro::DynamicMroErrorKind;
 use crate::types::newtype::NewType;
 use crate::types::set_theoretic::RecursivelyDefined;
 use crate::types::signatures::CallableSignature;
+use crate::types::special_form::{PermittedQualifierContext, TypeQualifier};
 use crate::types::subclass_of::SubclassOfInner;
 use crate::types::tuple::{Tuple, TupleLength, TupleSpecBuilder, TupleType};
 use crate::types::type_alias::{ManualPEP695TypeAliasType, PEP695TypeAliasType};
@@ -3839,8 +3841,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             );
 
             if !annotated.qualifiers.is_empty() {
-                for qualifier in [TypeQualifiers::CLASS_VAR, TypeQualifiers::INIT_VAR] {
-                    if annotated.qualifiers.contains(qualifier)
+                for qualifier in TypeQualifier::iter() {
+                    if !qualifier.is_valid_for_non_name_targets()
+                        && annotated
+                            .qualifiers
+                            .contains(TypeQualifiers::from(qualifier))
                         && let Some(builder) = self
                             .context
                             .report_lint(&INVALID_TYPE_FORM, annotation.as_ref())
@@ -4116,53 +4121,133 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         if !declared.qualifiers.is_empty() {
-            let current_scope_id = self.scope().file_scope_id(self.db());
-            let current_scope = self.index.scope(current_scope_id);
-            if current_scope.kind() != ScopeKind::Class {
-                for qualifier in [TypeQualifiers::CLASS_VAR, TypeQualifiers::INIT_VAR] {
-                    if declared.qualifiers.contains(qualifier)
-                        && let Some(builder) =
-                            self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+            for qualifier in TypeQualifier::iter() {
+                if !declared
+                    .qualifiers
+                    .contains(TypeQualifiers::from(qualifier))
+                {
+                    continue;
+                }
+                let current_scope_id = self.scope().file_scope_id(self.db());
+
+                if self.index.scope(current_scope_id).kind() != ScopeKind::Class {
+                    match qualifier {
+                        TypeQualifier::Final => {}
+                        TypeQualifier::ClassVar => {
+                            if let Some(builder) =
+                                self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+                            {
+                                builder
+                                    .into_diagnostic("`ClassVar` is only allowed in class bodies");
+                            }
+                        }
+                        TypeQualifier::InitVar => {
+                            if let Some(builder) =
+                                self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+                            {
+                                builder.into_diagnostic(
+                                    "`InitVar` is only allowed in dataclass fields",
+                                );
+                            }
+                        }
+                        TypeQualifier::NotRequired
+                        | TypeQualifier::ReadOnly
+                        | TypeQualifier::Required => {
+                            if let Some(builder) =
+                                self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+                            {
+                                builder.into_diagnostic(format_args!(
+                                    "`{name}` is only allowed in TypedDict fields",
+                                    name = qualifier.name()
+                                ));
+                            }
+                        }
+                    }
+
+                    continue;
+                }
+
+                let permitted_context = qualifier.permitted_context();
+                let nearest_enclosing_class =
+                    nearest_enclosing_class(self.db(), self.index, self.scope());
+                let in_typed_dict = nearest_enclosing_class.is_some_and(|class| {
+                    class.iter_mro(self.db(), None).any(|base| {
+                        matches!(
+                            base,
+                            ClassBase::TypedDict
+                                | ClassBase::Dynamic(DynamicType::TodoFunctionalTypedDict)
+                        )
+                    })
+                });
+
+                if in_typed_dict {
+                    if !permitted_context.contains(PermittedQualifierContext::TYPED_DICT_CLASS_BODY)
                     {
+                        let Some(builder) =
+                            self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+                        else {
+                            continue;
+                        };
                         builder.into_diagnostic(format_args!(
-                            "`{name}` annotations are only allowed in class-body scopes",
+                            "`{name}` is not allowed in TypedDict class bodies",
                             name = qualifier.name()
                         ));
                     }
-                }
-            }
-
-            // `Required`, `NotRequired`, and `ReadOnly` are only valid inside TypedDict classes.
-            if declared.qualifiers.intersects(
-                TypeQualifiers::REQUIRED | TypeQualifiers::NOT_REQUIRED | TypeQualifiers::READ_ONLY,
-            ) {
-                let in_typed_dict = current_scope.kind() == ScopeKind::Class
-                    && nearest_enclosing_class(self.db(), self.index, self.scope()).is_some_and(
-                        |class| {
-                            class.iter_mro(self.db(), None).any(|base| {
-                                matches!(
-                                    base,
-                                    ClassBase::TypedDict
-                                        | ClassBase::Dynamic(DynamicType::TodoFunctionalTypedDict)
+                } else {
+                    if permitted_context
+                        .contains(PermittedQualifierContext::NON_TYPED_DICT_CLASS_BODY)
+                    {
+                        let in_dataclass = nearest_enclosing_class
+                            .and_then(|class| {
+                                CodeGeneratorKind::from_class(
+                                    self.db(),
+                                    ClassLiteral::Static(class),
+                                    None,
                                 )
                             })
-                        },
-                    );
-                if !in_typed_dict {
-                    for qualifier in [
-                        TypeQualifiers::REQUIRED,
-                        TypeQualifiers::NOT_REQUIRED,
-                        TypeQualifiers::READ_ONLY,
-                    ] {
-                        if declared.qualifiers.contains(qualifier)
-                            && let Some(builder) =
-                                self.context.report_lint(&INVALID_TYPE_FORM, annotation)
-                        {
-                            builder.into_diagnostic(format_args!(
-                                "`{name}` is only allowed in TypedDict fields",
-                                name = qualifier.name()
-                            ));
+                            .is_some_and(|kind| {
+                                matches!(kind, CodeGeneratorKind::DataclassLike(_))
+                            });
+
+                        if in_dataclass {
+                            if !permitted_context
+                                .contains(PermittedQualifierContext::DATACLASS_CLASS_BODY)
+                            {
+                                let Some(builder) =
+                                    self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+                                else {
+                                    continue;
+                                };
+                                builder.into_diagnostic(format_args!(
+                                    "`{name}` is not allowed in dataclass fields",
+                                    name = qualifier.name()
+                                ));
+                            }
+                        } else {
+                            if !permitted_context
+                                .contains(PermittedQualifierContext::NON_DATACLASS_CLASS_BODY)
+                            {
+                                let Some(builder) =
+                                    self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+                                else {
+                                    continue;
+                                };
+                                builder.into_diagnostic(format_args!(
+                                    "`{name}` is only allowed in dataclass fields",
+                                    name = qualifier.name()
+                                ));
+                            }
                         }
+                    } else {
+                        let Some(builder) =
+                            self.context.report_lint(&INVALID_TYPE_FORM, annotation)
+                        else {
+                            continue;
+                        };
+                        builder.into_diagnostic(format_args!(
+                            "`{name}` is only allowed in TypedDict fields",
+                            name = qualifier.name()
+                        ));
                     }
                 }
             }

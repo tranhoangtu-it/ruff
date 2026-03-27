@@ -28,12 +28,15 @@ use crate::{
             },
             function_known_decorators, nearest_enclosing_function,
         },
-        infer_definition_types, infer_scope_types, todo_type,
+        infer_definition_types, infer_scope_types,
+        special_form::TypeQualifier,
+        todo_type,
     },
 };
 
 use ruff_python_ast as ast;
 use ruff_text_size::Ranged;
+use strum::IntoEnumIterator;
 
 impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     pub(super) fn infer_function_body(&mut self, function: &ast::StmtFunctionDef) {
@@ -501,12 +504,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         if annotated.qualifiers.is_empty() {
             return;
         }
-        for qualifier in [
-            TypeQualifiers::FINAL,
-            TypeQualifiers::CLASS_VAR,
-            TypeQualifiers::INIT_VAR,
-        ] {
-            if annotated.qualifiers.contains(qualifier)
+        for qualifier in TypeQualifier::iter() {
+            if annotated
+                .qualifiers
+                .contains(TypeQualifiers::from(qualifier))
                 && let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, returns)
             {
                 builder.into_diagnostic(format!(
@@ -582,15 +583,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return;
         }
 
-        for qualifier in [
-            TypeQualifiers::FINAL,
-            TypeQualifiers::CLASS_VAR,
-            TypeQualifiers::INIT_VAR,
-            TypeQualifiers::REQUIRED,
-            TypeQualifiers::NOT_REQUIRED,
-            TypeQualifiers::READ_ONLY,
-        ] {
-            if qualifiers.contains(qualifier)
+        for qualifier in TypeQualifier::iter() {
+            if qualifiers.contains(TypeQualifiers::from(qualifier))
                 && let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, parameter)
             {
                 builder.into_diagnostic(format!(

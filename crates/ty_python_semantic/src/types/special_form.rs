@@ -857,7 +857,7 @@ impl std::fmt::Display for LegacyStdlibAlias {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, get_size2::GetSize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, get_size2::GetSize, strum_macros::EnumIter)]
 pub enum TypeQualifier {
     ReadOnly,
     Final,
@@ -901,7 +901,7 @@ impl TypeQualifier {
         }
     }
 
-    const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::ReadOnly => "ReadOnly",
             Self::Final => "Final",
@@ -943,6 +943,39 @@ impl TypeQualifier {
             }
         }
     }
+    pub(crate) const fn is_valid_for_non_name_targets(self) -> bool {
+        match self {
+            TypeQualifier::ReadOnly
+            | TypeQualifier::Required
+            | TypeQualifier::NotRequired
+            | TypeQualifier::ClassVar
+            | TypeQualifier::InitVar => false,
+            TypeQualifier::Final => true,
+        }
+    }
+
+    pub(crate) fn permitted_context(self) -> PermittedQualifierContext {
+        match self {
+            TypeQualifier::Required | TypeQualifier::NotRequired | TypeQualifier::ReadOnly => {
+                // only permitted in TypedDict class bodies
+                // (which therefore means that they are permitted in non-dataclasses)
+                PermittedQualifierContext::TYPED_DICT_CLASS_BODY
+                    | PermittedQualifierContext::NON_DATACLASS_CLASS_BODY
+            }
+            TypeQualifier::InitVar => {
+                // Only permitted in dataclass fields
+                // (which therefore means that they are permitted in non-TypedDicts)
+                PermittedQualifierContext::DATACLASS_CLASS_BODY
+                    | PermittedQualifierContext::NON_TYPED_DICT_CLASS_BODY
+            }
+            TypeQualifier::ClassVar | TypeQualifier::Final => {
+                // Permitted in dataclasses and non-dataclasses, but not TypedDicts.
+                PermittedQualifierContext::DATACLASS_CLASS_BODY
+                    | PermittedQualifierContext::NON_DATACLASS_CLASS_BODY
+                    | PermittedQualifierContext::NON_TYPED_DICT_CLASS_BODY
+            }
+        }
+    }
 }
 
 impl From<TypeQualifier> for SpecialFormType {
@@ -967,6 +1000,21 @@ impl From<TypeQualifier> for TypeQualifiers {
 impl std::fmt::Display for TypeQualifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         SpecialFormType::from(*self).fmt(f)
+    }
+}
+
+bitflags::bitflags! {
+    /// Contexts in which a `TypeQualifier` is permitted to appear.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct PermittedQualifierContext: u8 {
+        /// This qualifier is permitted in the body of a `TypedDict` class.
+        const TYPED_DICT_CLASS_BODY = 1 << 0;
+        /// This qualifier is permitted in contexts other than the body of a `TypedDict` class.
+        const NON_TYPED_DICT_CLASS_BODY = 1 << 1;
+        /// This qualifier is permitted in dataclass fields.
+        const DATACLASS_CLASS_BODY = 1 << 2;
+        /// This qualifier is permitted in contexts other than dataclass fields.
+        const NON_DATACLASS_CLASS_BODY = 1 << 3;
     }
 }
 
