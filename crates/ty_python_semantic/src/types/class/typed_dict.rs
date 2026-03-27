@@ -404,12 +404,6 @@ where
                 field.declared_ty,
             );
 
-            let t_default = BoundTypeVarInstance::synthetic(
-                db,
-                Name::new_static("T"),
-                TypeVarVariance::Covariant,
-            );
-
             // Non-generic overload that accepts the field type as the default,
             // providing bidirectional inference context for the default argument.
             let pop_with_typed_default_sig = Signature::new(
@@ -425,6 +419,12 @@ where
                     ],
                 ),
                 field.declared_ty,
+            );
+
+            let t_default = BoundTypeVarInstance::synthetic(
+                db,
+                Name::new_static("T"),
+                TypeVarVariance::Covariant,
             );
 
             let pop_with_default_sig = Signature::new_generic(
