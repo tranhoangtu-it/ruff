@@ -640,6 +640,8 @@ impl<'db> DataclassParams<'db> {
 pub enum Type<'db> {
     /// The dynamic type: a statically unknown set of values
     Dynamic(DynamicType<'db>),
+    /// A cycle marker used during recursive type inference.
+    Divergent(DivergentType),
     /// The empty set of values
     Never,
     /// A specific function object
@@ -776,11 +778,11 @@ impl<'db> Type<'db> {
     }
 
     pub(crate) fn divergent(id: salsa::Id) -> Self {
-        Self::Dynamic(DynamicType::Divergent(DivergentType { id }))
+        Self::Divergent(DivergentType { id })
     }
 
     pub(crate) const fn is_divergent(&self) -> bool {
-        matches!(self, Type::Dynamic(DynamicType::Divergent(_)))
+        matches!(self, Type::Divergent(_))
     }
 
     pub const fn is_unknown(&self) -> bool {
@@ -924,7 +926,6 @@ impl<'db> Type<'db> {
             DynamicType::Any
             | DynamicType::Unknown
             | DynamicType::UnknownGeneric(_)
-            | DynamicType::Divergent(_)
             | DynamicType::UnspecializedTypeVar => false,
             DynamicType::Todo(_)
             | DynamicType::TodoStarredExpression
@@ -1542,7 +1543,7 @@ impl<'db> Type<'db> {
         match self {
             Type::Never => Type::object(),
 
-            Type::Dynamic(_) => *self,
+            Type::Dynamic(_) | Type::Divergent(_) => *self,
 
             Type::NominalInstance(instance) if instance.is_object() => Type::Never,
 
@@ -1610,6 +1611,7 @@ impl<'db> Type<'db> {
             | Type::TypeAlias(_)
             | Type::SubclassOf(_)=> true,
             Type::Intersection(_)
+            | Type::Divergent(_)
             | Type::SpecialForm(_)
             | Type::BoundSuper(_)
             | Type::BoundMethod(_)
@@ -1805,6 +1807,7 @@ impl<'db> Type<'db> {
             Type::TypeGuard(type_guard) => {
                 recursive_type_normalize_type_guard_like(db, type_guard, div, nested)
             }
+            Type::Divergent(_) => Some(self),
             Type::Dynamic(dynamic) => Some(Type::Dynamic(dynamic.recursive_type_normalized())),
             Type::TypedDict(_) => {
                 // TODO: Normalize TypedDicts
@@ -1961,7 +1964,7 @@ impl<'db> Type<'db> {
     /// for more complicated types that are actually singletons.
     pub(crate) fn is_singleton(self, db: &'db dyn Db) -> bool {
         match self {
-            Type::Dynamic(_) | Type::Never => false,
+            Type::Dynamic(_) | Type::Divergent(_) | Type::Never => false,
 
             Type::LiteralValue(literal) => match literal.kind() {
                 LiteralValueTypeKind::Int(..)
@@ -2150,6 +2153,7 @@ impl<'db> Type<'db> {
             Type::TypeAlias(alias) => alias.value_type(db).is_single_valued(db),
 
             Type::Dynamic(_)
+            | Type::Divergent(_)
             | Type::Never
             | Type::Union(..)
             | Type::Intersection(..)
@@ -2197,7 +2201,7 @@ impl<'db> Type<'db> {
                 }))
             }
 
-            Type::Dynamic(_) | Type::Never => Some(Place::bound(self).into()),
+            Type::Dynamic(_) | Type::Divergent(_) | Type::Never => Some(Place::bound(self).into()),
 
             Type::ClassLiteral(class) if class.is_typed_dict(db) => {
                 Some(class.typed_dict_member(db, None, name, policy))
@@ -2399,7 +2403,7 @@ impl<'db> Type<'db> {
             Type::Intersection(intersection) => intersection
                 .map_with_boundness_and_qualifiers(db, |elem| elem.instance_member(db, name)),
 
-            Type::Dynamic(_) | Type::Never => Place::bound(self).into(),
+            Type::Dynamic(_) | Type::Divergent(_) | Type::Never => Place::bound(self).into(),
 
             Type::NominalInstance(instance) => instance.class(db).instance_member(db, name),
             Type::NewTypeInstance(newtype) => {
@@ -2623,7 +2627,7 @@ impl<'db> Type<'db> {
             PlaceAndQualifiers {
                 place:
                     Place::Defined(DefinedPlace {
-                        ty: Type::Dynamic(_) | Type::Never,
+                        ty: Type::Dynamic(_) | Type::Divergent(_) | Type::Never,
                         ..
                     }),
                 qualifiers: _,
@@ -2942,7 +2946,7 @@ impl<'db> Type<'db> {
                     elem.member_lookup_with_policy(db, name_str.into(), policy)
                 }),
 
-            Type::Dynamic(..) | Type::Never => Place::bound(self).into(),
+            Type::Dynamic(..) | Type::Divergent(_) | Type::Never => Place::bound(self).into(),
 
             Type::FunctionLiteral(function) if name == "__get__" => Place::bound(
                 Type::KnownBoundMethod(KnownBoundMethodType::FunctionTypeDunderGet(function)),
@@ -3830,7 +3834,7 @@ impl<'db> Type<'db> {
 
             // Dynamic types are callable, and the return type is the same dynamic type. Similarly,
             // `Never` is always callable and returns `Never`.
-            Type::Dynamic(_) | Type::Never => {
+            Type::Dynamic(_) | Type::Divergent(_) | Type::Never => {
                 Binding::single(self, Signature::dynamic(self)).into()
             }
 
@@ -4925,7 +4929,7 @@ impl<'db> Type<'db> {
                     return_ty: return_builder.map(IntersectionBuilder::build),
                 })
             }
-            ty @ (Type::Dynamic(_) | Type::Never) => Some(GeneratorTypes {
+            ty @ (Type::Dynamic(_) | Type::Divergent(_) | Type::Never) => Some(GeneratorTypes {
                 yield_ty: Some(ty),
                 send_ty: Some(ty),
                 return_ty: Some(ty),
@@ -4947,7 +4951,7 @@ impl<'db> Type<'db> {
     #[must_use]
     pub(crate) fn to_instance(self, db: &'db dyn Db) -> Option<Type<'db>> {
         match self {
-            Type::Dynamic(_) | Type::Never => Some(self),
+            Type::Dynamic(_) | Type::Divergent(_) | Type::Never => Some(self),
             Type::ClassLiteral(class) => Some(Type::instance(db, class.default_specialization(db))),
             Type::GenericAlias(alias) => Some(Type::instance(db, ClassType::from(alias))),
             Type::SubclassOf(subclass_of_ty) => Some(subclass_of_ty.to_instance(db)),
@@ -5170,7 +5174,7 @@ impl<'db> Type<'db> {
                 }
             }
 
-            Type::Dynamic(_) => Ok(*self),
+            Type::Dynamic(_) | Type::Divergent(_) => Ok(*self),
 
             Type::NominalInstance(instance) => match instance.known_class(db) {
                 Some(KnownClass::NoneType) => Ok(Type::none(db)),
@@ -5252,6 +5256,7 @@ impl<'db> Type<'db> {
             Type::GenericAlias(alias) => ClassType::from(alias).metaclass(db),
             Type::SubclassOf(subclass_of_ty) => subclass_of_ty.to_meta_type(db),
             Type::Dynamic(dynamic) => SubclassOfType::from(db, SubclassOfInner::Dynamic(dynamic)),
+            Type::Divergent(_) => self,
             // TODO intersections
             Type::Intersection(_) => {
                 SubclassOfType::try_from_type(db, todo_type!("Intersection meta-type"))
@@ -5586,19 +5591,15 @@ impl<'db> Type<'db> {
                 TypeMapping::ReplaceParameterDefaults |
                 TypeMapping::EagerExpansion |
                 TypeMapping::RescopeReturnCallables(_) => self,
-                TypeMapping::Materialize(materialization_kind) => match self {
-                    // `Divergent` is an internal cycle marker rather than a gradual type like
-                    // `Any` or `Unknown`. Materializing it away would destroy the marker we rely
-                    // on for recursive alias convergence.
-                    // TODO: We elsewhere treat `Divergent` as a dynamic type, so failing to
-                    // materialize it away here could lead to odd behavior.
-                    Type::Dynamic(DynamicType::Divergent(_)) => self,
-                    _ => match materialization_kind {
-                        MaterializationKind::Top => Type::object(),
-                        MaterializationKind::Bottom => Type::Never,
-                    },
+                TypeMapping::Materialize(materialization_kind) => match materialization_kind {
+                    MaterializationKind::Top => Type::object(),
+                    MaterializationKind::Bottom => Type::Never,
                 }
             }
+            // `Divergent` is an internal cycle marker rather than a gradual type like `Any` or
+            // `Unknown`. Materializing it away would destroy the marker we rely on for recursive
+            // alias convergence.
+            Type::Divergent(_) => self,
 
             Type::Never
             | Type::AlwaysTruthy
@@ -5674,6 +5675,7 @@ impl<'db> Type<'db> {
                     typevars.insert(bound_typevar);
                 }
             }
+            Type::Divergent(_) => {}
 
             Type::FunctionLiteral(function) => {
                 visitor.visit(self, || {
@@ -6031,9 +6033,9 @@ impl<'db> Type<'db> {
             Self::AlwaysFalsy => Type::SpecialForm(SpecialFormType::AlwaysFalsy).definition(db),
 
             // These types have no definition
-            Self::Dynamic(
-                DynamicType::Divergent(_)
-                | DynamicType::Todo(_)
+            Self::Divergent(_)
+            | Self::Dynamic(
+                DynamicType::Todo(_)
                 | DynamicType::TodoUnpack
                 | DynamicType::TodoStarredExpression
                 | DynamicType::TodoTypeVarTuple
@@ -6211,6 +6213,7 @@ impl<'db> VarianceInferable<'db> for Type<'db> {
             Type::TypeGuard(type_guard_type) => type_guard_type.variance_of(db, typevar),
             Type::KnownInstance(known_instance) => known_instance.variance_of(db, typevar),
             Type::Dynamic(_)
+            | Type::Divergent(_)
             | Type::Never
             | Type::WrapperDescriptor(_)
             | Type::KnownBoundMethod(_)
@@ -6523,8 +6526,6 @@ pub enum DynamicType<'db> {
     TodoTypeVarTuple,
     /// A special Todo-variant for functional `TypedDict`s.
     TodoFunctionalTypedDict,
-    /// A type that is determined to be divergent during recursive type inference.
-    Divergent(DivergentType),
 }
 
 impl DynamicType<'_> {
@@ -6550,7 +6551,6 @@ impl std::fmt::Display for DynamicType<'_> {
             DynamicType::TodoStarredExpression => f.write_str("@Todo(StarredExpression)"),
             DynamicType::TodoTypeVarTuple => f.write_str("@Todo(TypeVarTuple)"),
             DynamicType::TodoFunctionalTypedDict => f.write_str("@Todo(Functional TypedDicts)"),
-            DynamicType::Divergent(_) => f.write_str("Divergent"),
         }
     }
 }
