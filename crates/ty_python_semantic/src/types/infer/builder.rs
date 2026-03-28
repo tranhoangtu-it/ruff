@@ -6189,8 +6189,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         .variables(db)
                         .zip(tcx_specialization.types(db))
                     {
+                        let declared_ty = declared_ty
+                            .class_specialization(db)
+                            .filter(|specialization| {
+                                specialization.generic_context(db) == generic_context
+                            })
+                            .map(|specialization| {
+                                Type::instance(
+                                    db,
+                                    collection_alias
+                                        .origin(db)
+                                        .apply_specialization(db, |_| specialization),
+                                )
+                            })
+                            .unwrap_or(*declared_ty);
                         let identity = bound_typevar.identity(db);
-                        elt_tcx_constraints.insert(identity, *declared_ty);
+                        elt_tcx_constraints.insert(identity, declared_ty);
                         elt_tcx_variance.insert(identity, bound_typevar.variance(db));
                     }
                 } else {
